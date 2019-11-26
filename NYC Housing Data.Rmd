@@ -1,0 +1,227 @@
+---
+title: "New York City Housing Analysis"
+subtitle: November 22, 2019
+output: html_notebook
+---
+
+```{r echo = FALSE, warning = FALSE}
+library(rlist)
+library(dplyr)
+library(stringr)
+library(purrrlyr)
+```
+
+```{r}
+contains_data <- function(filename) {
+  sentinel <- "data_with_overlays"
+  return(grepl(sentinel, filename, fixed = TRUE))
+}
+
+keep_nonmoe_column <- function(colname) {
+  sentinel <- "Margin"
+  return(!grepl(sentinel, colname, fixed = TRUE))
+}
+
+tidy_colnames <- function(colnames) {
+  pattern <- "[0-9]+\\.*[0-9]*"
+  matches <- str_extract_all(colnames, pattern)
+  colname_ranges <- lapply(matches, function(x) { paste(x, collapse = " to ")}) %>% unlist()
+  colname_ranges <- gsub("\\.", "", colname_ranges)
+  colname_ranges[1] = "Total"
+  colname_ranges[2] = "Total Cash Rent"
+  colname_ranges[length(colname_ranges)] = "No Cash Rent"
+  return(colname_ranges)
+}
+
+group_2000_plus_rents <- function(dat) {
+  ncols_in_2013_2016 <- 26
+  if (ncol(dat) > ncols_in_2013_2016) {
+    dat <- cbind(dat[,1:24], rowSums(dat[,25:(ncol(dat)-1)]), dat[,ncol(dat)])
+    colnames(dat)[(ncol(dat)-1):ncol(dat)] <- c("2000", "No Cash Rent")
+  }
+  return(dat)
+}
+
+load_and_clean_data <- function(path, is_dist = FALSE) {
+  dat <- read.csv(path, skip = 1)
+  dat <- dat[,sapply(colnames(dat), keep_nonmoe_column)]
+  if (is_dist) {
+    colnames(dat)[-c(1:2)] <- tidy_colnames(colnames(dat)[-c(1,2)]) 
+    dat <- group_2000_plus_rents(dat)
+  } else {
+    colnames(dat)[ncol(dat)] <- "Median_Rent"
+    dat$Cleaned_Median_Rent <- 
+      plyr::mapvalues(dat$Median_Rent, from = c("-", "2,000+", "3,500+"), to = c("0", "2000", "3500")) %>% 
+      as.character() %>% 
+      as.numeric() 
+    # dat <- dat %>% mutate(Cleaned_Median_Rent = ifelse(Cleaned_Median_Rent >= 2000, 2000, Cleaned_Median_Rent))
+  }
+  colnames(dat)[c(1:2)] <- c("ID", "Area")
+  dat <- dat %>% mutate(ID = gsub("1500000US", "", ID)) %>% 
+    mutate(State_FIPS = substr(ID, 1, 2)) %>%
+    mutate(County_FIPS = substr(ID, 3, 5)) %>% 
+    mutate(Tract_FIPS = substr(ID, 6, 11)) %>% 
+    mutate(BG_FIPS = substr(ID, 12, 12))
+  return(as_tibble(dat))
+}
+```
+
+```{r warning = FALSE}
+path <- paste(getwd(), "Data", sep = "/")
+folders <- c(
+  "Manhattan - Median Gross Rent", 
+  "Queens - Median Gross Rent", 
+  "Kings - Median Gross Rent"
+)
+
+files <- list.files(path)
+keep <- sapply(files, contains_data)
+files <- files[keep]
+
+dat <- NULL
+dim <- NULL
+
+for (folder in folders) {
+  folder_path <- paste(path, folder, sep = "/")
+  files <- list.files(folder_path)
+  keep <- sapply(files, contains_data)
+  files <- files[keep]
+  
+  year <- 2013
+  for (file in files) {
+    dat_path <- paste(folder_path, file, sep = "/")
+    tmp <- load_and_clean_data(dat_path)
+    tmp$Year <- year
+    year <- year + 1
+    
+    # Basic error checking
+    stopifnot(is.null(dim) || dim[2] == dim(tmp)[2])
+    dim = dim(tmp)
+    
+    dat <- bind_rows(dat, tmp)
+    rm(tmp)
+  }
+}
+```
+
+```{r}
+hellinger_dist <- function(p, q) {
+  score <- (sqrt(p)-sqrt(q))^2 %>% sum() %>% sqrt() %>% unlist()
+  return(score/sqrt(2))
+}
+
+calc_distance_from_cheapest <- function(observation) {
+  total <- 4
+  no_cash_rent <- 26
+  n_bins <- no_cash_rent-(total+1)
+  observation <- observation[c(total:no_cash_rent)]
+  
+  reference <- rep(0, n_bins)
+  reference[1] <- observation[[1]]
+  adjusted_observation <- (1+(observation[[length(observation)]]/max(observation[[1]], 1))) * 
+    observation[c(2:(length(observation)-1))]
+  return(hellinger_dist(reference, adjusted_observation))
+}
+
+normalit <- function(x) {
+  return((x-min(x))/(max(x)-min(x)))
+}
+
+# (Used for the Share of Income on Rent distributional dataset -- calculating Bhattacharya distances
+# against a reference distribution for each observation and normalizing. Not relevant for Median Gross Rent)
+# 
+# dat <- dat %>% by_row(calc_distance_from_cheapest, .to = "Score", .collate = "rows") %>% 
+#   mutate(Score = normalit(Score))
+```
+
+```{r warning = FALSE}
+library(ggplot2)
+
+dat %>% filter(Cleaned_Median_Rent > 0) %>% ggplot(aes(x = Cleaned_Median_Rent)) + 
+  geom_histogram(fill = "lightblue", col = "black") + 
+  labs(x = "Median Rent", y = "Count") + 
+  facet_wrap(~Year, ncol = 3) + 
+  ggtitle("Distribution of Gross Rent", subtitle = "American Community Survey, 2013-2017") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"))
+```
+
+```{r}
+median_rents_by_yr <- dat %>% 
+  filter(Cleaned_Median_Rent > 0) %>% 
+  group_by(Year) %>% 
+  summarise(rent = median(Cleaned_Median_Rent))
+
+ggplot(median_rents_by_yr, aes(x = Year, y = rent)) + 
+  geom_line(col = "lightblue") +
+  geom_point(shape = 21, col = "lightblue", fill = "white", stroke = 1) + 
+  labs(x = "Year", y = "Median Gross Rent") + 
+  ggtitle("Median Gross Rent by Year", subtitle = "American Community Survey, 2013-2017") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"))
+```
+
+```{r}
+block_groups_max_change <- dat %>% 
+  group_by(ID) %>% 
+  transmute(Change = abs(last(Cleaned_Median_Rent)-first(Cleaned_Median_Rent))) %>%
+  distinct() %>%
+  arrange(desc(Change)) %>%
+  head(n = 5)
+
+dat %>% filter(ID %in% block_groups_max_change$ID) %>%
+  ggplot(aes(x = Year, y = Cleaned_Median_Rent, color = ID)) +
+  geom_line() +
+  geom_point(shape = 21, fill = "white", stroke = 1) +
+  labs(x = "Year", y = "Median Gross Rent", color = "Block Group ID") +
+  ggtitle("Median Gross Rent by Year, Top 5 Delta Block Groups",
+          subtitle = "American Community Survey, 2013-2017") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(face = "italic"),
+        legend.position = "bottom")
+
+
+```
+
+```{r warning = FALSE}
+library(sf)
+
+shp_path <- paste(getwd(), "Shapefiles", "tl_2015_36_bg", "tl_2015_36_bg.shp", sep = "/")
+shp <- st_read(shp_path)
+```
+
+```{r warning = FALSE}
+
+dat_change <- dat %>% group_by(ID) %>%
+  summarise(Change = last(Cleaned_Median_Rent)-first(Cleaned_Median_Rent)) %>%
+  distinct() %>%
+  filter(Change > 0)
+
+dat_change %>% ggplot(aes(x = Change)) + 
+  geom_histogram(fill = "lightblue", col = "black") + 
+  labs(x = "Change in Gross Median Rent, 2013-2017", y = "Count") + 
+  ggtitle("Change in Gross Rent", subtitle = "American Community Survey, 2013-2017") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"))
+
+```
+
+```{r}
+nyc_counties <- c("061", "047")
+shp %>% filter(COUNTYFP %in% nyc_counties) %>% 
+  inner_join(dat_change, by = c("GEOID" = "ID")) %>%
+  ggplot() + 
+  geom_sf(color = "grey", fill = "grey") + 
+  geom_sf(aes(fill = Change), size = 0.1) + 
+  coord_sf(crs = st_crs(2263)) + 
+  theme_bw() + 
+  ggtitle("Change in Median Gross Rent", subtitle = "American Community Survey, 2013-2017") + 
+  labs(fill = "Change ($)") + 
+  theme(plot.title = element_text(face = "bold"), 
+        plot.subtitle = element_text(face = "italic"),
+        axis.text = element_blank(), 
+        axis.ticks = element_blank()) + 
+  scale_fill_gradient(low = "white", high = "red")
+```
+
