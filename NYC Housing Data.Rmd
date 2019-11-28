@@ -7,8 +7,11 @@ output: html_notebook
 ```{r echo = FALSE, warning = FALSE}
 library(rlist)
 library(dplyr)
+library(ggplot2)
 library(stringr)
 library(purrrlyr)
+library(spdep)
+library(sf)
 ```
 
 ```{r}
@@ -54,7 +57,6 @@ load_and_clean_data <- function(path, is_dist = FALSE) {
       plyr::mapvalues(dat$Median_Rent, from = c("-", "2,000+", "3,500+"), to = c("0", "2000", "3500")) %>% 
       as.character() %>% 
       as.numeric() 
-    # dat <- dat %>% mutate(Cleaned_Median_Rent = ifelse(Cleaned_Median_Rent >= 2000, 2000, Cleaned_Median_Rent))
   }
   colnames(dat)[c(1:2)] <- c("ID", "Area")
   dat <- dat %>% mutate(ID = gsub("1500000US", "", ID)) %>% 
@@ -66,19 +68,15 @@ load_and_clean_data <- function(path, is_dist = FALSE) {
 }
 ```
 
-```{r warning = FALSE}
+```{r warning = FALSE, echo = FALSE}
 path <- paste(getwd(), "Data", sep = "/")
 folders <- c(
-  "Manhattan - Median Gross Rent", 
-  "Queens - Median Gross Rent", 
-  "Kings - Median Gross Rent"
+  "Manhattan - Gross Rent", 
+  "Queens - Gross Rent", 
+  "Kings - Gross Rent"
 )
 
-files <- list.files(path)
-keep <- sapply(files, contains_data)
-files <- files[keep]
-
-dat <- NULL
+dat_distribution <- NULL
 dim <- NULL
 
 for (folder in folders) {
@@ -90,7 +88,7 @@ for (folder in folders) {
   year <- 2013
   for (file in files) {
     dat_path <- paste(folder_path, file, sep = "/")
-    tmp <- load_and_clean_data(dat_path)
+    tmp <- load_and_clean_data(dat_path, is_dist = TRUE)
     tmp$Year <- year
     year <- year + 1
     
@@ -98,65 +96,97 @@ for (folder in folders) {
     stopifnot(is.null(dim) || dim[2] == dim(tmp)[2])
     dim = dim(tmp)
     
-    dat <- bind_rows(dat, tmp)
+    dat_distribution <- bind_rows(dat_distribution, tmp)
     rm(tmp)
   }
 }
+
+folders <- c(
+  "Manhattan - Median Gross Rent", 
+  "Queens - Median Gross Rent", 
+  "Kings - Median Gross Rent"
+)
+
+dat_rent <- NULL
+dim <- NULL
+
+for (folder in folders) {
+  folder_path <- paste(path, folder, sep = "/")
+  files <- list.files(folder_path)
+  keep <- sapply(files, contains_data)
+  files <- files[keep]
+  
+  year <- 2013
+  for (file in files) {
+    dat_path <- paste(folder_path, file, sep = "/")
+    tmp <- load_and_clean_data(dat_path, is_dist = FALSE)
+    tmp$Year <- year
+    year <- year + 1
+    
+    # Basic error checking
+    stopifnot(is.null(dim) || dim[2] == dim(tmp)[2])
+    dim = dim(tmp)
+    
+    dat_rent <- bind_rows(dat_rent, tmp)
+    rm(tmp)
+  }
+}
+
+dat_rent <- dat_rent %>% select(ID, Median_Rent, Cleaned_Median_Rent, Year) %>%
+  arrange()
+dat <- dat_distribution %>% inner_join(dat_rent, by = c("ID" = "ID", "Year" = "Year"))
 ```
 
 ```{r}
 hellinger_dist <- function(p, q) {
   score <- (sqrt(p)-sqrt(q))^2 %>% sum() %>% sqrt() %>% unlist()
-  return(score/sqrt(2))
+  return(score)
 }
 
 calc_distance_from_cheapest <- function(observation) {
-  total <- 4
-  no_cash_rent <- 26
-  n_bins <- no_cash_rent-(total+1)
-  observation <- observation[c(total:no_cash_rent)]
+  begin <- 5
+  end <- 25
+
+  observation <- observation[c(begin:end)]
+  observation <- (observation/max(sum(observation), 1)) %>% unlist %>% cumsum()
   
-  reference <- rep(0, n_bins)
-  reference[1] <- observation[[1]]
-  adjusted_observation <- (1+(observation[[length(observation)]]/max(observation[[1]], 1))) * 
-    observation[c(2:(length(observation)-1))]
-  return(hellinger_dist(reference, adjusted_observation))
+  anchor <- ifelse(sum(observation) > 0, 1, 0)
+  reference <- rep(anchor/((end-begin)+1), (end-begin)+1) %>% cumsum()
+  return(hellinger_dist(reference, observation))
 }
 
 normalit <- function(x) {
   return((x-min(x))/(max(x)-min(x)))
 }
+```
 
-# (Used for the Share of Income on Rent distributional dataset -- calculating Bhattacharya distances
-# against a reference distribution for each observation and normalizing. Not relevant for Median Gross Rent)
-# 
-# dat <- dat %>% by_row(calc_distance_from_cheapest, .to = "Score", .collate = "rows") %>% 
-#   mutate(Score = normalit(Score))
+```{r}
+dat <- dat %>% by_row(calc_distance_from_cheapest, .to = "Score", .collate = "rows") %>%
+  mutate(Score = normalit(Score))
+write.csv(dat, "2013-2017 - Median rent and distribution.csv")
 ```
 
 ```{r warning = FALSE}
-library(ggplot2)
-
-dat %>% filter(Cleaned_Median_Rent > 0) %>% ggplot(aes(x = Cleaned_Median_Rent)) + 
+dat %>% filter(Score != 0) %>%
+  ggplot(aes(x = Score)) + 
   geom_histogram(fill = "lightblue", col = "black") + 
-  labs(x = "Median Rent", y = "Count") + 
+  labs(x = "Rent Distribution vs. Reference", y = "Count") + 
   facet_wrap(~Year, ncol = 3) + 
-  ggtitle("Distribution of Gross Rent", subtitle = "American Community Survey, 2013-2017") + 
+  ggtitle("Change in Rent Distribution", subtitle = "American Community Survey, 2013-2017") + 
   theme_minimal() + 
   theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"))
 ```
 
 ```{r}
 median_rents_by_yr <- dat %>% 
-  filter(Cleaned_Median_Rent > 0) %>% 
   group_by(Year) %>% 
-  summarise(rent = median(Cleaned_Median_Rent))
+  summarise(rent = median(Score))
 
 ggplot(median_rents_by_yr, aes(x = Year, y = rent)) + 
   geom_line(col = "lightblue") +
   geom_point(shape = 21, col = "lightblue", fill = "white", stroke = 1) + 
-  labs(x = "Year", y = "Median Gross Rent") + 
-  ggtitle("Median Gross Rent by Year", subtitle = "American Community Survey, 2013-2017") + 
+  labs(x = "Year", y = "Median Rent Distribution Score") + 
+  ggtitle("Median Rent Distribution Score by Year", subtitle = "American Community Survey, 2013-2017") + 
   theme_minimal() + 
   theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"))
 ```
@@ -164,51 +194,44 @@ ggplot(median_rents_by_yr, aes(x = Year, y = rent)) +
 ```{r}
 block_groups_max_change <- dat %>% 
   group_by(ID) %>% 
-  transmute(Change = abs(last(Cleaned_Median_Rent)-first(Cleaned_Median_Rent))) %>%
+  transmute(Change = abs(last(Score)-first(Score))) %>%
   distinct() %>%
   arrange(desc(Change)) %>%
   head(n = 5)
 
 dat %>% filter(ID %in% block_groups_max_change$ID) %>%
-  ggplot(aes(x = Year, y = Cleaned_Median_Rent, color = ID)) +
+  ggplot(aes(x = Year, y = Score, color = ID)) +
   geom_line() +
   geom_point(shape = 21, fill = "white", stroke = 1) +
-  labs(x = "Year", y = "Median Gross Rent", color = "Block Group ID") +
-  ggtitle("Median Gross Rent by Year, Top 5 Delta Block Groups",
+  labs(x = "Year", y = "Rent Distribution Score", color = "Block Group ID") +
+  ggtitle("Rent Distribution Score by Year, Top 5 Delta Block Groups",
           subtitle = "American Community Survey, 2013-2017") +
   theme_minimal() +
   theme(plot.title = element_text(face = "bold"),
         plot.subtitle = element_text(face = "italic"),
         legend.position = "bottom")
-
-
 ```
 
 ```{r warning = FALSE}
-library(sf)
-
 shp_path <- paste(getwd(), "Shapefiles", "tl_2015_36_bg", "tl_2015_36_bg.shp", sep = "/")
 shp <- st_read(shp_path)
 ```
 
 ```{r warning = FALSE}
-
 dat_change <- dat %>% group_by(ID) %>%
-  summarise(Change = last(Cleaned_Median_Rent)-first(Cleaned_Median_Rent)) %>%
-  distinct() %>%
-  filter(Change > 0)
+  summarise(Change = last(Score)-first(Score)) %>%
+  distinct()
 
 dat_change %>% ggplot(aes(x = Change)) + 
   geom_histogram(fill = "lightblue", col = "black") + 
-  labs(x = "Change in Gross Median Rent, 2013-2017", y = "Count") + 
-  ggtitle("Change in Gross Rent", subtitle = "American Community Survey, 2013-2017") + 
+  labs(x = "Change in Rent Distribution, 2013-2017", y = "Count") + 
+  ggtitle("Change in Rent Distribution", subtitle = "American Community Survey, 2013-2017") + 
   theme_minimal() + 
   theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"))
-
 ```
 
 ```{r}
-nyc_counties <- c("061", "047")
+nyc_counties <- c("061")
 shp %>% filter(COUNTYFP %in% nyc_counties) %>% 
   inner_join(dat_change, by = c("GEOID" = "ID")) %>%
   ggplot() + 
@@ -216,12 +239,163 @@ shp %>% filter(COUNTYFP %in% nyc_counties) %>%
   geom_sf(aes(fill = Change), size = 0.1) + 
   coord_sf(crs = st_crs(2263)) + 
   theme_bw() + 
-  ggtitle("Change in Median Gross Rent", subtitle = "American Community Survey, 2013-2017") + 
-  labs(fill = "Change ($)") + 
+  ggtitle("Change in Rent Distribution", subtitle = "American Community Survey, 2013-2017") + 
+  labs(fill = "Change (+ more expensive)") + 
   theme(plot.title = element_text(face = "bold"), 
         plot.subtitle = element_text(face = "italic"),
         axis.text = element_blank(), 
         axis.ticks = element_blank()) + 
-  scale_fill_gradient(low = "white", high = "red")
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0)
+```
+
+```{r}
+dat %>% filter(Cleaned_Median_Rent > 0) %>%
+  ggplot(aes(x = Score, y = Cleaned_Median_Rent)) + 
+  geom_point(shape = 21, fill = "white", stroke = 0.5) + 
+  geom_smooth(method = "lm") + 
+  labs(x = "Rent Distribution Score", y = "Median Rent") + 
+  facet_wrap(~Year, ncol = 3)
+  ggtitle("Rent Distribution Balance Score vs. Median Rent", subtitle = "American Community Survey, 2013-2017") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"))
+  
+```
+
+```{r}
+dat <- dat %>% group_by(ID) %>% 
+  arrange(Year) %>%
+  mutate(Lagged_Rent = lag(Cleaned_Median_Rent)) %>% 
+  mutate(Lagged_Score = lag(Score))
+```
+
+
+```{r warning = FALSE, echo = FALSE}
+nyc_counties <- c("061", "081", "047")
+shp <- shp %>% filter(COUNTYFP %in% nyc_counties)
+edgelist <- poly2nb(as(shp, "Spatial"), queen = FALSE) %>% 
+  expp::neighborsDataFrame() %>% 
+  rename(Neighbor = id, Centroid = id_neigh)
+edgelist <- apply(edgelist, 2, as.character) %>%
+  plyr::mapvalues(from = seq(1, nrow(shp), by = 1), to = c(as.character(shp$GEOID))) %>% 
+  data.frame(stringsAsFactors = FALSE)
+```
+
+```{r}
+test <- edgelist[1:17,] %>% as_tibble()
+shp %>% filter(GEOID %in% test$Neighbor | GEOID %in% test$Centroid) %>% 
+  mutate(Neighbor = as.factor(ifelse(GEOID %in% test$Neighbor, "Neighbor", "Nucleus"))) %>% 
+  ggplot() + 
+  geom_sf(aes(fill = Neighbor)) + 
+  coord_sf(crs = st_crs(2263)) + 
+  theme_bw() + 
+  ggtitle("Verifying that poly2nb works as desired") + 
+  labs(fill = "") + 
+  theme(plot.title = element_text(face = "bold"), 
+        axis.text = element_blank(), 
+        axis.ticks = element_blank())
+```
+
+```{r}
+summarise_lagged_feature <- function(observation, summary_func, dat, edgelist, feature_name) {
+  neighbors <- edgelist %>% filter(Centroid == observation$ID)
+  neighbor_data <- dat %>% filter(ID %in% neighbors$Neighbor, Year == observation$Year) %>% 
+    ungroup() %>%
+    select(!!feature_name) %>% 
+    unlist()
+  return(summary_func(neighbor_data))
+}
+
+dat_gph_features <- dat %>% select(ID, Area, Year, Cleaned_Median_Rent, Score, Lagged_Rent, Lagged_Score) %>%
+  filter(!is.na(Lagged_Rent) & !is.na(Lagged_Score))
+
+summarise_lagged_rent_median <- function(observation) {
+  return(summarise_lagged_feature(observation, 
+                                  median, 
+                                  dat = dat_gph_features, 
+                                  edgelist = edgelist, 
+                                  feature_name = "Lagged_Rent"))
+}
+
+summarise_lagged_rent_mean <- function(observation) {
+  return(summarise_lagged_feature(observation, 
+                                  mean, 
+                                  dat = dat_gph_features, 
+                                  edgelist = edgelist, 
+                                  feature_name = "Lagged_Rent"))
+}
+
+summarise_lagged_rent_sum <- function(observation) {
+  return(summarise_lagged_feature(observation, 
+                                  sum, 
+                                  dat = dat_gph_features, 
+                                  edgelist = edgelist, 
+                                  feature_name = "Lagged_Rent"))
+}
+
+summarise_lagged_score_median <- function(observation) {
+  return(summarise_lagged_feature(observation, 
+                                  median, 
+                                  dat = dat_gph_features, 
+                                  edgelist = edgelist, 
+                                  feature_name = "Lagged_Score"))
+}
+
+summarise_lagged_score_mean <- function(observation) {
+  return(summarise_lagged_feature(observation, 
+                                  mean, 
+                                  dat = dat_gph_features, 
+                                  edgelist = edgelist, 
+                                  feature_name = "Lagged_Score"))
+}
+
+summarise_lagged_score_sum <- function(observation) {
+  return(summarise_lagged_feature(observation, 
+                                  sum, 
+                                  dat = dat_gph_features, 
+                                  edgelist = edgelist, 
+                                  feature_name = "Lagged_Score"))
+}
+
+dat_gph_features <- dat_gph_features %>% 
+  by_row(summarise_lagged_rent_median, .to = "Lagged_Med_Neighb_Rent", .collate = "rows") %>%
+  by_row(summarise_lagged_rent_mean, .to = "Lagged_Mean_Neighb_Rent", .collate = "rows") %>%
+  by_row(summarise_lagged_rent_sum, .to = "Lagged_Sum_Neighb_Rent", .collate = "rows") %>%
+  by_row(summarise_lagged_score_median, .to = "Lagged_Med_Neighb_Score", .collate = "rows") %>%
+  by_row(summarise_lagged_score_mean, .to = "Lagged_Mean_Neighb_Score", .collate = "rows") %>%
+  by_row(summarise_lagged_score_sum, .to = "Lagged_Sum_Neighb_Score", .collate = "rows")
+write.csv(dat_gph_features, "2013-2017 - Rent with graph features.csv")
+
+test <- dat_gph_features[1,]
+test_neighbors <- edgelist %>% filter(Centroid == test$ID)
+dat_test_neighbors <- dat %>% filter(ID %in% test_neighbors$Neighbor & Year == test$Year)
+stopifnot(median(dat_test_neighbors$Lagged_Rent) == test$Lagged_Med_Neighb_Rent)
+```
+
+
+```{r}
+dat_gph_features %>% filter(Cleaned_Median_Rent > 0) %>%
+  select(ID, Cleaned_Median_Rent, Lagged_Med_Neighb_Rent, Lagged_Mean_Neighb_Rent, Lagged_Sum_Neighb_Rent) %>% 
+  reshape2::melt(id = c("ID", "Cleaned_Median_Rent")) %>%
+  ggplot(aes(x = Cleaned_Median_Rent, y = value)) + 
+  geom_point(shape = 21, fill = "white", stroke = 0.5) + 
+  geom_smooth(method = "lm") + 
+  labs(x = "Median Rent in Year", y = "Lagged Summarised Neighborood Rent") + 
+  facet_wrap(~variable, ncol = 3, scales = "free") + 
+  ggtitle("Lagged Neighborhood Rent vs. In-Year Median Rent", subtitle = "American Community Survey, 2013-2017") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"))
+
+dat_gph_features %>% filter(Cleaned_Median_Rent > 0) %>%
+  select(ID, Score, Lagged_Med_Neighb_Score, Lagged_Mean_Neighb_Score, Lagged_Sum_Neighb_Score) %>% 
+  reshape2::melt(id = c("ID", "Score")) %>%
+  ggplot(aes(x = Score, y = value)) + 
+  geom_point(shape = 21, fill = "white", stroke = 0.5) + 
+  geom_smooth(method = "lm") + 
+  labs(x = "Rent Distribution Score in Year", y = "Lagged Summarised Rent Score") + 
+  facet_wrap(~variable, ncol = 3, scales = "free") + 
+  ggtitle("Lagged Neighborhood Rent Distribution Score vs. In-Year Score", 
+          subtitle = "American Community Survey, 2013-2017") + 
+  theme_minimal() + 
+  theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(face = "italic"))
 ```
 
